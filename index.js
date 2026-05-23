@@ -302,86 +302,9 @@ app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, r
   return res.status(400).json({ error: 'Unknown interaction type' });
 });
 
-// ─── Existing support bot logic ───────────────────────────────────────────────
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`[proxy] Logged in as ${readyClient.user.tag}`);
 });
-
-const SUPPORT_CHANNEL_ID = process.env.SUPPORT_CHANNEL_ID || '';
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
-const PROXY_SECRET = process.env.PROXY_SECRET || '';
-
-client.on(Events.MessageCreate, async (message) => {
-  if (message.author?.bot) return;
-
-  const isDM = message.channel.type === ChannelType.DM;
-
-  if (isDM) {
-    await forwardToN8n(message, message.channelId, true);
-    return;
-  }
-
-  if (SUPPORT_CHANNEL_ID && message.channelId !== SUPPORT_CHANNEL_ID) return;
-
-  try { await message.delete(); } catch (err) {}
-
-  try {
-    const dmChannel = await message.author.createDM();
-    await dmChannel.send(
-      `Hey ${message.author.username}! 👋 Thanks for reaching out to **The Madden Academy** support.\n\nI got your message and I'm here to help. What's going on?`
-    );
-    await forwardToN8n(message, dmChannel.id, true);
-  } catch (err) {
-    try {
-      const fallback = await message.channel.send(
-        `Hey ${message.author.username}, I tried to DM you but your DMs appear to be closed. Please enable DMs from server members in your Privacy Settings and try again!`
-      );
-      setTimeout(() => fallback.delete().catch(() => {}), 10000);
-    } catch (e) {}
-  }
-});
-
-async function forwardToN8n(message, replyChannelId, isDM) {
-  if (message.partial) {
-    try { await message.fetch(); } catch (e) { return; }
-  }
-
-  const payload = {
-    id: message.id,
-    content: message.content,
-    channel_id: replyChannelId,
-    original_channel_id: message.channelId,
-    channel_type: message.channel.type,
-    guild_id: message.guildId || null,
-    author: {
-      id: message.author.id,
-      username: message.author.username,
-      discriminator: message.author.discriminator,
-      bot: message.author.bot,
-    },
-    timestamp: message.createdAt.toISOString(),
-    is_dm: isDM,
-    surface: isDM ? 'dm' : 'channel',
-    channel_name: isDM ? 'DM' : (message.channel.name || 'unknown'),
-  };
-
-  const headers = { 'Content-Type': 'application/json' };
-  if (PROXY_SECRET) headers['x-proxy-secret'] = PROXY_SECRET;
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await fetch(N8N_WEBHOOK_URL, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-      });
-      if (response.ok) break;
-      if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
-    } catch (err) {
-      if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
-    }
-  }
-}
 
 client.on(Events.Error, (err) => {
   console.error('[proxy] Discord client error:', err.message);
