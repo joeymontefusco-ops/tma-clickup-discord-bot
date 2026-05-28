@@ -14,6 +14,9 @@ const CLICKUP_IN_REVIEW_STATUS = process.env.CLICKUP_IN_REVIEW_STATUS || 'in rev
 // In-memory store for threadData keyed by messageId
 const draftStore = new Map();
 
+// In-memory store for clip data keyed by messageId
+const clipStore = new Map();
+
 async function updateClickUpStatus(taskId, status) {
   await axios.put(
     `https://api.clickup.com/api/v2/task/${taskId}`,
@@ -113,6 +116,84 @@ app.post('/send-draft', async (req, res) => {
   }
 });
 
+/**
+ * POST /send-clips
+ * Body: { channelId, clips: [{index, url, duration, score, thumbnail}], driveFileId, hookText }
+ * Sends each clip as a separate Discord message with Approve/Reject buttons
+ */
+app.post('/send-clips', async (req, res) => {
+  const { channelId, clips, driveFileId, hookText } = req.body;
+
+  if (!channelId || !clips || clips.length === 0) {
+    return res.status(400).json({ error: 'Missing channelId or clips' });
+  }
+
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel) return res.status(404).json({ error: 'Channel not found' });
+
+    // Send header message
+    await channel.send({
+      content: `<@366635705964953601> 🎬 **${clips.length} OpusClip${clips.length > 1 ? 's' : ''} ready for review — approve to quote tweet the thread**`,
+    });
+
+    const messageIds = [];
+
+    for (const clip of clips) {
+      const durationStr = clip.duration ? `${Math.floor(clip.duration)}s` : 'unknown duration';
+      const scoreStr = clip.score ? ` · Score: ${clip.score}` : '';
+
+      const embed = new EmbedBuilder()
+        .setTitle(`🎬 Clip ${clip.index} — ${durationStr}${scoreStr}`)
+        .setColor(0x1DA1F2)
+        .setDescription(`**Preview:** ${clip.url}`)
+        .setFooter({ text: 'Approve to quote tweet the thread • Reject to skip this clip' })
+        .setTimestamp();
+
+      if (clip.thumbnail) {
+        embed.setImage(clip.thumbnail);
+      }
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`approve_clip::${clip.index}`)
+          .setLabel('✅ Approve')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`reject_clip::${clip.index}`)
+          .setLabel('❌ Reject')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      const message = await channel.send({
+        embeds: [embed],
+        components: [row],
+      });
+
+      // Store clip data keyed by messageId
+      clipStore.set(message.id, {
+        clipIndex: clip.index,
+        clipUrl: clip.url,
+        duration: clip.duration,
+        driveFileId: driveFileId || '',
+        hookText: hookText || '',
+        storedAt: Date.now(),
+      });
+
+      console.log(`[clips] Sent clip ${clip.index} as message ${message.id}`);
+      messageIds.push(message.id);
+
+      // Small delay between messages
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    res.json({ success: true, messageIds });
+  } catch (err) {
+    console.error('[clips] Error sending clips:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.listen(PORT, () => console.log(`[express] Server running on port ${PORT}`));
@@ -187,6 +268,52 @@ app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, r
     const token = interaction.token;
     const messageId = interaction.message?.id;
 
+    // ── Clip approve/reject buttons ───────────────────────────────────────────
+    if (customId.startsWith('approve_clip') || customId.startsWith('reject_clip')) {
+      const [action, clipIndex] = customId.split('::');
+      const username = interaction.member?.user?.username || interaction.user?.username;
+      const stored = clipStore.get(messageId);
+
+      res.json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
+
+      if (action === 'approve_clip') {
+        const N8N_CLIP_WEBHOOK = process.env.N8N_CLIP_WEBHOOK;
+        if (N8N_CLIP_WEBHOOK && stored) {
+          await axios.post(N8N_CLIP_WEBHOOK, {
+            action: 'approve',
+            clipIndex: stored.clipIndex,
+            clipUrl: stored.clipUrl,
+            duration: stored.duration,
+            driveFileId: stored.driveFileId,
+            hookText: stored.hookText,
+            approvedBy: username,
+            timestamp: new Date().toISOString(),
+          }).catch(err => console.error('[clips] Failed to forward approval to n8n:', err.message));
+        }
+
+        clipStore.delete(messageId);
+
+        await editInteractionMessage(
+          token,
+          `✅ **Clip ${clipIndex} approved!** Will be posted as a quote tweet after the thread goes live.\n\n_Approved by ${username}_`,
+          [],
+          []
+        ).catch(err => console.error('[clips] Failed to update message:', err.message));
+
+      } else if (action === 'reject_clip') {
+        clipStore.delete(messageId);
+
+        await editInteractionMessage(
+          token,
+          `❌ **Clip ${clipIndex} rejected.**\n\n_Rejected by ${username}_`,
+          [],
+          []
+        ).catch(err => console.error('[clips] Failed to update message:', err.message));
+      }
+
+      return;
+    }
+
     // ── Twitter draft approval buttons ────────────────────────────────────────
     if (customId.startsWith('approve_draft') || customId.startsWith('reject_draft')) {
       const N8N_APPROVAL_WEBHOOK = process.env.N8N_APPROVAL_WEBHOOK;
@@ -197,7 +324,7 @@ app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, r
         res.json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
 
         const draft = interaction.message.embeds?.[0]?.description?.split('---\n\n')[1] || '';
-        
+
         // Retrieve stored threadData
         const stored = draftStore.get(messageId);
         const threadData = stored ? stored.threadData : null;
