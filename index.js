@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const crypto = require('crypto');
 const { verifyKeyMiddleware, InteractionType, InteractionResponseType } = require('discord-interactions');
 const axios = require('axios');
 const app = express();
@@ -196,6 +197,115 @@ app.post('/send-clips', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+// ============================================================
+// TRAIN WITH MANU — Discord Coaching Channel Creator
+// ============================================================
+
+function verifyWebhookSecret(req) {
+  const incoming = req.headers['x-twm-secret'] || '';
+  const expected = process.env.TWM_WEBHOOK_SECRET || '';
+  if (!expected) return true;
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(incoming),
+      Buffer.from(expected)
+    );
+  } catch {
+    return false;
+  }
+}
+
+app.post('/create-coaching-channel', async (req, res) => {
+  if (!verifyWebhookSecret(req)) {
+    console.warn('[TWM] Rejected request — bad webhook secret');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { user_id, first_name, last_name, email, order_id } = req.body;
+
+  if (!user_id || !first_name) {
+    return res.status(400).json({ error: 'Missing user_id or first_name' });
+  }
+
+  const guildId    = process.env.COACHING_GUILD_ID;
+  const categoryId = process.env.COACHING_CATEGORY_ID;
+  const manuId     = process.env.MANU_DISCORD_ID || '366635705964953601';
+
+  try {
+    const guild = await client.guilds.fetch(guildId);
+
+    const slug = `coaching-${first_name}${last_name ? '-' + last_name : ''}`
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '-')
+      .replace(/-+/g, '-')
+      .substring(0, 80);
+
+    // Idempotency check — don't create duplicates
+    const existing = guild.channels.cache.find(
+      ch => ch.name === slug && ch.parentId === categoryId
+    );
+    if (existing) {
+      console.log(`[TWM] Channel already exists: #${slug}`);
+      return res.json({
+        success: true,
+        channel_url: `https://discord.com/channels/${guildId}/${existing.id}`,
+        channel_id: existing.id,
+        already_existed: true,
+      });
+    }
+
+    const channel = await guild.channels.create({
+      name: slug,
+      type: 0, // GUILD_TEXT
+      parent: categoryId,
+      topic: `1-on-1 coaching channel for ${first_name}${last_name ? ' ' + last_name : ''} | Order #${order_id || 'N/A'}`,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: ['ViewChannel'],
+        },
+        {
+          id: manuId,
+          allow: ['ViewChannel', 'SendMessages', 'ReadMessageHistory', 'ManageMessages'],
+        },
+        {
+          id: client.user.id,
+          allow: ['ViewChannel', 'SendMessages', 'ReadMessageHistory', 'ManageMessages'],
+        },
+      ],
+    });
+
+    console.log(`[TWM] Created coaching channel #${slug} (${channel.id}) for user ${user_id}`);
+
+    const fullName = [first_name, last_name].filter(Boolean).join(' ');
+    await channel.send(
+      `👋 **New coaching member alert!**\n\n` +
+      `<@${manuId}> — **${fullName}** just joined as a 1-on-1 coaching member.\n\n` +
+      `📋 **Details:**\n` +
+      `• Name: ${fullName}\n` +
+      `• Email: ${email || 'N/A'}\n` +
+      `• Order: #${order_id || 'N/A'}\n\n` +
+      `Say hi and get the ball rolling! 🏆`
+    );
+
+    const channelUrl = `https://discord.com/channels/${guildId}/${channel.id}`;
+
+    return res.json({
+      success: true,
+      channel_url: channelUrl,
+      channel_id: channel.id,
+    });
+
+  } catch (err) {
+    console.error('[TWM] Failed to create coaching channel:', err);
+    return res.status(500).json({ error: 'Failed to create channel', detail: err.message });
+  }
+});
+
+// ============================================================
+// END Train with Manu block
+// ============================================================
+
 app.listen(PORT, () => console.log(`[express] Server running on port ${PORT}`));
 
 // ─── Discord client ───────────────────────────────────────────────────────────
@@ -205,6 +315,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.DirectMessageTyping,
@@ -325,7 +436,6 @@ app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, r
 
         const draft = interaction.message.embeds?.[0]?.description?.split('---\n\n')[1] || '';
 
-        // Retrieve stored threadData
         const stored = draftStore.get(messageId);
         const threadData = stored ? stored.threadData : null;
         const storedDriveFileId = stored ? stored.driveFileId : driveFileId;
@@ -344,7 +454,6 @@ app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, r
           }).catch(err => console.error('Failed to forward approval:', err.message));
         }
 
-        // Clean up store
         draftStore.delete(messageId);
 
         await editInteractionMessage(
