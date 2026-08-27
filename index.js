@@ -99,16 +99,16 @@ app.post('/send-draft', async (req, res) => {
       components: [row],
     });
 
-    // Store threadData keyed by messageId
-    if (threadData) {
-      draftStore.set(message.id, {
-        threadData,
-        driveFileId: driveFileId || '',
-        fileName: fileName || '',
-        storedAt: Date.now()
-      });
-      console.log(`[store] Stored threadData for message ${message.id}`);
-    }
+    // Store draft text + threadData keyed by messageId (needed later at approve-modal-submit time,
+    // since modal submissions don't have access to the original message's embed)
+    draftStore.set(message.id, {
+      threadData: threadData || null,
+      draft: draft || '',
+      driveFileId: driveFileId || '',
+      fileName: fileName || '',
+      storedAt: Date.now()
+    });
+    console.log(`[store] Stored draft${threadData ? ' + threadData' : ''} for message ${message.id}`);
 
     res.json({ success: true, messageId: message.id });
   } catch (err) {
@@ -339,6 +339,56 @@ app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, r
   if (interaction.type === 5) {
     const customId = interaction.data.custom_id;
 
+    if (customId.startsWith('approve_playbook::')) {
+      const [, tweetId, driveFileId, messageId] = customId.split('::');
+      const playbook = interaction.data.components[0].components[0].value || '';
+      const formation = interaction.data.components[1].components[0].value || '';
+      const username = interaction.member?.user?.username || interaction.user?.username;
+      const token = interaction.token;
+
+      res.json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
+
+      const stored = draftStore.get(messageId);
+      const threadData = stored ? stored.threadData : null;
+      const storedDriveFileId = stored ? stored.driveFileId : driveFileId;
+      // draft text isn't available here (modal submit has no access to the original
+      // message's embed) — pull it back out of the stored draftStore entry if present,
+      // otherwise n8n falls back to whatever it already has for this driveFileId.
+      const draft = stored?.draft || '';
+
+      console.log(`[approve] messageId: ${messageId}, hasThreadData: ${!!threadData}, playbook: "${playbook}", formation: "${formation}"`);
+
+      const N8N_APPROVAL_WEBHOOK = process.env.N8N_APPROVAL_WEBHOOK;
+      if (N8N_APPROVAL_WEBHOOK) {
+        await axios.post(N8N_APPROVAL_WEBHOOK, {
+          action: 'approve',
+          tweetId,
+          driveFileId: storedDriveFileId,
+          draft,
+          threadData,
+          playbook: playbook.trim(),
+          formation: formation.trim(),
+          approvedBy: username,
+          timestamp: new Date().toISOString(),
+        }).catch(err => console.error('Failed to forward approval:', err.message));
+      }
+
+      draftStore.delete(messageId);
+
+      const infoLine = (playbook || formation)
+        ? `\n📋 Playbook: **${playbook || '—'}** · Formation: **${formation || '—'}**`
+        : '\n📋 _No playbook/formation provided — will auto-detect._';
+
+      await editInteractionMessage(
+        token,
+        `✅ **Post queued in Hypefury!** It will go live on @MaddenAcademy_ according to the schedule.${infoLine}\n\n_Approved by ${username}_`,
+        [],
+        []
+      ).catch(err => console.error('Failed to update message after approve:', err.message));
+
+      return;
+    }
+
     if (customId.startsWith('reject_feedback::')) {
       const [, driveFileId, channelId, messageId] = customId.split('::');
       const feedback = interaction.data.components[0].components[0].value;
@@ -432,36 +482,46 @@ app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, r
       const username = interaction.member?.user?.username || interaction.user?.username;
 
       if (action === 'approve_draft') {
-        res.json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
-
-        const draft = interaction.message.embeds?.[0]?.description?.split('---\n\n')[1] || '';
-
-        const stored = draftStore.get(messageId);
-        const threadData = stored ? stored.threadData : null;
-        const storedDriveFileId = stored ? stored.driveFileId : driveFileId;
-
-        console.log(`[approve] messageId: ${messageId}, hasThreadData: ${!!threadData}`);
-
-        if (N8N_APPROVAL_WEBHOOK) {
-          await axios.post(N8N_APPROVAL_WEBHOOK, {
-            action: 'approve',
-            tweetId,
-            driveFileId: storedDriveFileId,
-            draft,
-            threadData,
-            approvedBy: username,
-            timestamp: new Date().toISOString(),
-          }).catch(err => console.error('Failed to forward approval:', err.message));
-        }
-
-        draftStore.delete(messageId);
-
-        await editInteractionMessage(
-          token,
-          `✅ **Post queued in Hypefury!** It will go live on @MaddenAcademy_ according to the schedule.\n\n_Approved by ${username}_`,
-          [],
-          []
-        ).catch(err => console.error('Failed to update message after approve:', err.message));
+        // Ask Manu for playbook/formation before actually approving — both fields
+        // optional, so leaving them blank = skip (falls back to existing AI-guess
+        // scraping logic on the Railway side).
+        return res.json({
+          type: 9,
+          data: {
+            custom_id: `approve_playbook::${tweetId}::${driveFileId}::${messageId}`,
+            title: 'Madden School Info (optional)',
+            components: [
+              {
+                type: 1,
+                components: [
+                  {
+                    type: 4,
+                    custom_id: 'playbook',
+                    label: 'Playbook (leave blank to skip)',
+                    style: 1,
+                    placeholder: 'e.g. San Francisco, New Orleans Saints',
+                    required: false,
+                    max_length: 100,
+                  }
+                ]
+              },
+              {
+                type: 1,
+                components: [
+                  {
+                    type: 4,
+                    custom_id: 'formation',
+                    label: 'Formation (leave blank to skip)',
+                    style: 1,
+                    placeholder: 'e.g. Gun Doubles Flex Y Off Close',
+                    required: false,
+                    max_length: 100,
+                  }
+                ]
+              }
+            ]
+          }
+        });
 
       } else if (action === 'reject_draft') {
         const originalDraft = interaction.message.embeds?.[0]?.description?.split('---\n\n')[1] || '';
